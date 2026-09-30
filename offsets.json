@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "uuid": "9A0898A9-8556-35B0-A167-38F422B45457",
+  "frame": "0x1005cd5b8",
+  "setup": "0x1000b2fd0",
+  "actor_global": "0x102552ef8",
+  "champion_name_offset": "0x37b8",
+  "skin_id_offset": "0xb74"
+}
