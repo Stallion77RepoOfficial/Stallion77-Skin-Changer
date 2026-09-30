@@ -282,6 +282,18 @@ static bool fetch_url(const std::string& url, const fs::path& output) {
                                                       output.string()}));
 }
 
+// "16.19" from the game's content-metadata.json, empty if it cannot be read.
+static std::string installed_patch(const fs::path& game) {
+    rapidjson::Document meta;
+    meta.Parse(read_file(game.parent_path().parent_path().parent_path().parent_path() /
+                         "content-metadata.json").c_str());
+    if (meta.HasParseError() || !meta.IsObject() || !meta.HasMember("version") ||
+        !meta["version"].IsString()) return "";
+    const std::string version = meta["version"].GetString();
+    const size_t first = version.find('.'), second = version.find('.', first + 1);
+    return first == std::string::npos || second == std::string::npos ? "" : version.substr(0, second);
+}
+
 static bool update_catalog(const fs::path& directory, const fs::path& game) {
     const fs::path metadata = game.parent_path().parent_path().parent_path().parent_path()
         / "content-metadata.json";
@@ -756,9 +768,13 @@ int main(int argc, char** argv) {
     else if (selected.filename() == "LeagueofLegends.app")
         game = selected / "Contents/MacOS/LeagueofLegends";
     bool profile_ready = update_offsets(directory, game);
-    std::future<bool> catalog_task = std::async(std::launch::async,
-        [directory, game] { return update_catalog(directory, game); });
-    bool catalog_ready = false;
+    // The skin list is only downloaded when the Refresh button is pressed. It counts as
+    // current when it was built for the installed patch.
+    std::future<bool> catalog_task;
+    const std::string patch = installed_patch(game);
+    std::string built_for = read_file(directory / "skin_ids.version");
+    while (!built_for.empty() && std::isspace(static_cast<unsigned char>(built_for.back()))) built_for.pop_back();
+    bool catalog_ready = !patch.empty() && built_for == patch && fs::exists(directory / "skin_ids.json");
     fs::path data = directory / "skin_ids.json";
     if (!fs::exists(data)) data = directory / "data" / "skin_ids.json";
     auto champions = load_skins(data);
@@ -1101,6 +1117,7 @@ int main(int argc, char** argv) {
         if (catalog_task.valid() &&
             catalog_task.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
             catalog_ready = catalog_task.get();
+            if (!catalog_ready) message = "Skin list refresh failed";
             if (catalog_ready) {
                 auto refreshed = load_skins(directory / "skin_ids.json");
                 if (!refreshed.empty()) {
@@ -1205,10 +1222,20 @@ int main(int argc, char** argv) {
             keyboard.text_active.store(false);
         }
         if (!minimized) {
-        ImGui::TextWrapped("Game: %s | Offsets: %s | Skins: %s",
+        ImGui::Text("Game: %s | Offsets: %s | Skins: %s",
             snap.foreground ? "READY" : "WAITING FOR A MATCH",
             profile_ready ? "OK" : "ERROR",
-            catalog_task.valid() ? "CHECKING" : (catalog_ready ? "OK" : "ERROR"));
+            catalog_task.valid() ? "CHECKING" : (catalog_ready ? "OK" : "OUTDATED"));
+        {
+            const float refresh_w = ImGui::CalcTextSize("Refresh").x + 2 * style.FramePadding.x;
+            ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - refresh_w -
+                                                                 style.WindowPadding.x));
+            if (catalog_task.valid()) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Refresh"))
+                catalog_task = std::async(std::launch::async,
+                    [directory, game] { return update_catalog(directory, game); });
+            if (catalog_task.valid()) ImGui::EndDisabled();
+        }
         ImGui::Separator();
         ImGui::SetNextItemWidth(-FLT_MIN);
         ImGui::InputTextWithHint("##search", "Search champion", filter, sizeof filter);
