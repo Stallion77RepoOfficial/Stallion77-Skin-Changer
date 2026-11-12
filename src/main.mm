@@ -7,6 +7,8 @@
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
 #include "imgui_impl_opengl3.h"
+#include "special_forms.hpp"
+#include "skin_hud.hpp"
 #include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
@@ -85,6 +87,19 @@ static MouseMapping map_mouse(const OverlayGeometry& g, CGPoint global) {
     return {global.x - origin_x, global.y - origin_y, g.measured};
 }
 
+// The redrawn skin HUD, as far as the event tap needs to know.
+struct HudInput {
+    bool visible = false;
+    CGRect bounds = CGRectZero;    // global, top-left origin
+    std::vector<CGRect> regions;   // form buttons, then the toggle
+};
+enum class HudEventKind { Hover, Press, Release, DragStart, Drag, DragEnd };
+struct HudEvent {
+    HudEventKind kind;
+    int region;
+    CGPoint point;
+};
+
 struct KeyboardCapture {
     std::atomic<bool> text_active{false};
     std::atomic<bool> overlay_visible{false};
@@ -98,7 +113,12 @@ struct KeyboardCapture {
     std::mutex mutex;
     std::vector<CapturedKey> pending;
     std::vector<CapturedMouse> mouse_pending;
+    std::vector<HudEvent> hud_events;
     double wheel = 0;
+    std::mutex hud_mutex;
+    HudInput hud;
+    int hud_hover = -1, hud_pressed = -1;  // tap thread only
+    bool hud_dragging = false, hud_inside = false;  // tap thread only
     CFMachPortRef tap = nullptr;
     CFRunLoopSourceRef source = nullptr;
     CFRunLoopRef runloop = nullptr;
@@ -107,6 +127,63 @@ struct KeyboardCapture {
 // The render loop sleeps until something happens; input arrives on the tap thread.
 static void wake_main(KeyboardCapture* capture) {
     if (!capture->wake_pending.exchange(true)) glfwPostEmptyEvent();
+}
+
+// The redrawn skin HUD sits over the game's own HUD area. Clicks on its buttons
+// never reach the game, the same as the game's own HUD; Option-drag moves it.
+// Returns true when the event belongs to the HUD.
+static bool hud_tap(KeyboardCapture* capture, CGEventType type, CGEventRef event) {
+    HudInput hud;
+    { std::lock_guard<std::mutex> lock(capture->hud_mutex); hud = capture->hud; }
+    if (!hud.visible) {
+        capture->hud_hover = capture->hud_pressed = -1;
+        capture->hud_dragging = capture->hud_inside = false;
+        return false;
+    }
+    const CGPoint point = CGEventGetLocation(event);
+    int region = -1;
+    for (size_t i = 0; i < hud.regions.size() && region < 0; ++i)
+        if (CGRectContainsPoint(hud.regions[i], point)) region = static_cast<int>(i);
+    auto push = [&](HudEventKind kind, int index) {
+        { std::lock_guard<std::mutex> lock(capture->mutex);
+          capture->hud_events.push_back({kind, index, point}); }
+        wake_main(capture);
+    };
+    if (capture->hud_dragging) {
+        if (type == kCGEventLeftMouseDragged) { push(HudEventKind::Drag, -1); return true; }
+        if (type == kCGEventLeftMouseUp) {
+            capture->hud_dragging = false;
+            push(HudEventKind::DragEnd, -1);
+            return true;
+        }
+    }
+    if (type == kCGEventLeftMouseDown && (CGEventGetFlags(event) & kCGEventFlagMaskAlternate) &&
+        CGRectContainsPoint(hud.bounds, point)) {
+        capture->hud_dragging = true;
+        push(HudEventKind::DragStart, -1);
+        return true;
+    }
+    // Moves over the HUD also place the cursor the HUD draws.
+    const bool inside = CGRectContainsPoint(hud.bounds, point);
+    if ((type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged) &&
+        (inside || capture->hud_inside || region != capture->hud_hover)) {
+        capture->hud_inside = inside;
+        capture->hud_hover = region;
+        push(HudEventKind::Hover, region);
+    }
+    if (type == kCGEventLeftMouseDown && region >= 0) {
+        capture->hud_pressed = region;
+        push(HudEventKind::Press, region);
+        return true;
+    }
+    // A press on the HUD never reached the game, so neither do its drag and release.
+    if (type == kCGEventLeftMouseDragged && capture->hud_pressed >= 0) return true;
+    if (type == kCGEventLeftMouseUp && capture->hud_pressed >= 0) {
+        push(HudEventKind::Release, region == capture->hud_pressed ? region : -1);
+        capture->hud_pressed = -1;
+        return true;
+    }
+    return (type == kCGEventRightMouseDown || type == kCGEventRightMouseUp) && region >= 0;
 }
 
 static CGEventRef keyboard_tap(CGEventTapProxy, CGEventType type,
@@ -122,8 +199,14 @@ static CGEventRef keyboard_tap(CGEventTapProxy, CGEventType type,
         capture->text_active.store(false);
         capture->mouse_captured.store(false);
         capture->mouse_inside.store(false);
+        capture->hud_hover = capture->hud_pressed = -1;
+        capture->hud_dragging = capture->hud_inside = false;
         return event;
     }
+    if ((type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged ||
+         type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp ||
+         type == kCGEventRightMouseDown || type == kCGEventRightMouseUp) &&
+        !capture->mouse_captured.load() && hud_tap(capture, type, event)) return nullptr;
     if (type == kCGEventMouseMoved || type == kCGEventLeftMouseDragged ||
         type == kCGEventLeftMouseDown || type == kCGEventLeftMouseUp ||
         type == kCGEventScrollWheel) {
@@ -294,6 +377,48 @@ static std::string installed_patch(const fs::path& game) {
     return first == std::string::npos || second == std::string::npos ? "" : version.substr(0, second);
 }
 
+// The game's HUD scale slider ([HUD] GlobalScale in LoL/Config/game.cfg), 1 if unknown.
+static double hud_scale_setting(const fs::path& game) {
+    const fs::path config = game.parent_path().parent_path().parent_path().parent_path()
+        .parent_path() / "Config" / "game.cfg";
+    std::istringstream lines(read_file(config));
+    std::string line;
+    bool hud = false;
+    while (std::getline(lines, line)) {
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (!line.empty() && line[0] == '[') { hud = line == "[HUD]"; continue; }
+        if (hud && line.rfind("GlobalScale=", 0) == 0) return std::atof(line.c_str() + 12);
+    }
+    return 1.0;
+}
+
+// A skin HUD is redrawn from the game's own layout and textures, as
+// CommunityDragon publishes them for the installed patch (else its latest data).
+// Files are cached below cache/ with their game path.
+static bool fetch_skin_hud(const fs::path& cache, const std::string& patch,
+                           const stallion::SkinHudSpec& spec) {
+    auto fetch = [&](const std::string& path) {
+        const fs::path output = cache / path;
+        std::error_code error;
+        if (fs::file_size(output, error) > 0 && !error) return true;
+        fs::create_directories(output.parent_path(), error);
+        const fs::path partial = output.string() + ".download";
+        for (const std::string& version : {patch, std::string("latest")}) {
+            if (version.empty() ||
+                !fetch_url("https://raw.communitydragon.org/" + version + "/game/" + path, partial))
+                continue;
+            fs::rename(partial, output, error);
+            return !error;
+        }
+        fs::remove(partial, error);
+        return false;
+    };
+    if (!fetch(spec.layout)) return false;
+    for (const std::string& texture : stallion::skin_hud_textures(read_file(cache / spec.layout), spec))
+        if (!fetch(texture)) return false;
+    return true;
+}
+
 static bool update_catalog(const fs::path& directory, const fs::path& game) {
     const fs::path metadata = game.parent_path().parent_path().parent_path().parent_path()
         / "content-metadata.json";
@@ -308,7 +433,7 @@ static bool update_catalog(const fs::path& directory, const fs::path& game) {
     const std::string patch = installed.substr(0, second);
     const fs::path output = directory / "skin_ids.json";
     const fs::path version_file = directory / "skin_ids.version";
-    const fs::path scratch = directory / "build" / "riot_catalog";
+    const fs::path scratch = directory / "build" / "riot_catalog_runtime";
     std::error_code error;
     fs::create_directories(scratch, error);
     if (error) return false;
@@ -635,6 +760,7 @@ struct OverlayPrefs {
     bool positioned = false;               // moved by the user; else top-right corner
     double gap_right = 40, gap_top = 90;   // distance from the game area's top-right corner
     bool cursor = true;                    // draw a software cursor over the overlay
+    double hud_dx = 0, hud_dy = 0;         // Option-drag offset of the skin HUD (layout units)
 };
 
 // Text and spacing scale with the overlay's width so the layout never breaks.
@@ -661,6 +787,8 @@ static OverlayPrefs load_prefs(const fs::path& path) {
         else if (key == "gap_right") { prefs.gap_right = value; prefs.positioned = true; }
         else if (key == "gap_top") { prefs.gap_top = value; prefs.positioned = true; }
         else if (key == "cursor") prefs.cursor = value != 0;
+        else if (key == "hud_dx") prefs.hud_dx = std::clamp(value, -1600.0, 1600.0);
+        else if (key == "hud_dy") prefs.hud_dy = std::clamp(value, -1200.0, 1200.0);
     }
     prefs.width = std::clamp(prefs.width, kMinWidth, kMaxWidth);
     prefs.height = std::clamp(prefs.height, overlay_min_height(prefs.width), kMaxHeight);
@@ -676,6 +804,8 @@ static void save_prefs(const fs::path& path, const OverlayPrefs& prefs) {
         file << "gap_right=" << std::lround(prefs.gap_right)
              << "\ngap_top=" << std::lround(prefs.gap_top) << "\n";
     file << "cursor=" << (prefs.cursor ? 1 : 0) << "\n";
+    if (prefs.hud_dx != 0 || prefs.hud_dy != 0)
+        file << "hud_dx=" << std::lround(prefs.hud_dx) << "\nhud_dy=" << std::lround(prefs.hud_dy) << "\n";
 }
 
 // Rasterize the font at the size it is drawn at; scaling a 13 px atlas up blurs it.
@@ -724,17 +854,29 @@ static std::vector<Champion> load_skins(const fs::path& path) {
     return result;
 }
 
-static std::string run_command(const fs::path& tool, const char* command, pid_t game_pid,
-                               const std::string& champion, unsigned skin) {
+struct CommandResult {
+    std::string command;
+    std::string champion;
+    unsigned skin = 0;
+    int gear = -1;
+    int code = 1;  // stallion-core exit status; liveform uses 3 for "not loaded yet"
+    int forms = -1;  // forms of the skin the actor wears, when stallion-core reported them
+    std::string message;
+};
+
+static CommandResult run_command(const fs::path& tool, const char* command, pid_t game_pid,
+                                 const std::string& champion, unsigned skin, int gear = -1) {
+    CommandResult result{command, champion, skin, gear};
     int pipefd[2];
-    if (pipe(pipefd) != 0) return "Could not create output pipe";
+    if (pipe(pipefd) != 0) { result.message = "Could not create output pipe"; return result; }
     fcntl(pipefd[0], F_SETFD, FD_CLOEXEC);
     fcntl(pipefd[1], F_SETFD, FD_CLOEXEC);
-    const pid_t child = spawn_process(tool.c_str(),
-        {tool.string(), command, std::to_string(game_pid), std::to_string(skin),
-         "--champion:" + champion}, pipefd[1]);
+    std::vector<std::string> args = {tool.string(), command, std::to_string(game_pid),
+                                     std::to_string(skin), "--champion:" + champion};
+    if (gear >= 0) args.push_back("--gear:" + std::to_string(gear));
+    const pid_t child = spawn_process(tool.c_str(), args, pipefd[1]);
     close(pipefd[1]);
-    if (child < 0) { close(pipefd[0]); return "Could not start mod-tools"; }
+    if (child < 0) { close(pipefd[0]); result.message = "Could not start mod-tools"; return result; }
     std::string output;
     char buffer[1024];
     ssize_t count;
@@ -742,9 +884,20 @@ static std::string run_command(const fs::path& tool, const char* command, pid_t 
     close(pipefd[0]);
     int status = 0;
     waitpid(child, &status, 0);
-    if (WIFEXITED(status) && WEXITSTATUS(status) == 0)
-        return std::strcmp(command, "skinstate") == 0 ? output : "Skin changed in the current match";
-    return output.empty() ? "Live switch failed" : output;
+    result.code = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+    const size_t forms = output.rfind("forms=");
+    if (forms != std::string::npos && (forms == 0 || output[forms - 1] == '\n'))
+        result.forms = std::atoi(output.c_str() + forms + 6);
+    const bool live_form = std::strcmp(command, "liveform") == 0;
+    if (result.code == 0 || (live_form && result.code == 3)) {
+        // stallion-core's report of what it applied is for the terminal; the
+        // overlay says what changed in plain words.
+        if (std::strcmp(command, "skinstate") == 0) result.message = output;
+        else if (!live_form) result.message = "Skin changed";
+        return result;
+    }
+    result.message = output.empty() ? "Live switch failed" : output;
+    return result;
 }
 
 int main(int argc, char** argv) {
@@ -761,16 +914,29 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "Stallion77 Skin Changer is already running.\n");
         return 1;
     }
-    fs::path selected = argc > 1 ? argv[1] : fs::path("/Applications/League of Legends.app");
+    const bool headless_refresh = argc > 1 && std::strcmp(argv[1], "--refresh-data") == 0;
+    fs::path selected = argc > (headless_refresh ? 2 : 1)
+        ? argv[headless_refresh ? 2 : 1] : fs::path("/Applications/League of Legends.app");
     fs::path game = selected;
     if (selected.filename() == "League of Legends.app")
         game = selected / "Contents/LoL/Game/LeagueofLegends.app/Contents/MacOS/LeagueofLegends";
     else if (selected.filename() == "LeagueofLegends.app")
         game = selected / "Contents/MacOS/LeagueofLegends";
     bool profile_ready = update_offsets(directory, game);
+    if (headless_refresh) {
+        bool skins_ready = false;
+        try { skins_ready = update_catalog(directory, game); }
+        catch (const std::exception& error) {
+            std::fprintf(stderr, "skin catalog refresh failed: %s\n", error.what());
+        }
+        std::printf("Offsets: %s | Skins: %s\n", profile_ready ? "OK" : "ERROR",
+                    skins_ready ? "OK" : "OUTDATED");
+        return profile_ready && skins_ready ? 0 : 1;
+    }
     // The skin list is only downloaded when the Refresh button is pressed. It counts as
     // current when it was built for the installed patch.
     std::future<bool> catalog_task;
+    std::future<bool> offsets_task;
     const std::string patch = installed_patch(game);
     std::string built_for = read_file(directory / "skin_ids.version");
     while (!built_for.empty() && std::isspace(static_cast<unsigned char>(built_for.back()))) built_for.pop_back();
@@ -850,7 +1016,8 @@ int main(int argc, char** argv) {
         CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp) |
         CGEventMaskBit(kCGEventFlagsChanged) | CGEventMaskBit(kCGEventMouseMoved) |
         CGEventMaskBit(kCGEventLeftMouseDragged) | CGEventMaskBit(kCGEventLeftMouseDown) |
-        CGEventMaskBit(kCGEventLeftMouseUp) | CGEventMaskBit(kCGEventScrollWheel),
+        CGEventMaskBit(kCGEventLeftMouseUp) | CGEventMaskBit(kCGEventScrollWheel) |
+        CGEventMaskBit(kCGEventRightMouseDown) | CGEventMaskBit(kCGEventRightMouseUp),
         keyboard_tap, &keyboard);
     if (keyboard.tap) {
         keyboard.source = CFMachPortCreateRunLoopSource(kCFAllocatorDefault, keyboard.tap, 0);
@@ -883,7 +1050,19 @@ int main(int argc, char** argv) {
     int champion_index = 0;
     int skin_index = 0;
     char filter[96] = {};
-    std::future<std::string> pending;
+    std::future<CommandResult> pending;
+    // The skin last switched to in this match, so its forms can be chosen and
+    // its form and animation fixes repeated once the game has loaded it.
+    struct AppliedSkin {
+        pid_t pid = 0;
+        std::string champion;
+        unsigned skin = 0;
+        int gear = -1;
+        int forms = 0;  // as the game reports them for the skin it has loaded
+    } applied;
+    bool follow_up = false;
+    int follow_up_attempts = 0;
+    Clock::time_point follow_up_at{};
     int want_w = prefs.width, want_h = prefs.height;  // size the user chose
     int full_w = want_w, full_h = want_h;             // size in use (fits the game area)
     bool minimized = false;
@@ -914,6 +1093,29 @@ int main(int argc, char** argv) {
         : !input_ready
             ? "Input capture unavailable. Allow Accessibility/Input Monitoring for Stallion."
             : "Choose your current champion and a skin.";
+    // Selects a form of the switched skin, from the overlay's buttons or the
+    // redrawn skin HUD.
+    auto apply_form = [&](pid_t target_pid, const std::string& name, unsigned number, int form) {
+        const auto names = stallion::form_names(name, number);
+        const std::string label = form < names.count ? names.names[form] : std::to_string(form + 1);
+        message = "Applying " + label + "...";
+        follow_up = false;
+        pending = std::async(std::launch::async, [tool, target_pid, name, number, form, label] {
+            CommandResult result = run_command(tool, "liveform", target_pid, name, number, form);
+            if (result.code == 0 || result.code == 3) result.message = label + " selected";
+            return result;
+        });
+    };
+    // The switched skin's own HUD, redrawn over the game's HUD area.
+    std::unique_ptr<stallion::SkinHud> skin_hud;
+    std::future<bool> hud_download;
+    const stallion::SkinHudSpec* hud_download_spec = nullptr;
+    const stallion::SkinHudSpec* hud_failed = nullptr;  // not retried in this run
+    const fs::path hud_cache = directory / "build" / "skin_hud" / (patch.empty() ? "latest" : patch);
+    bool hud_shown = false;
+    double hud_scale = 1;
+    Clock::time_point hud_scale_read{};
+    CGPoint hud_drag_start = CGPointZero, hud_drag_origin = CGPointZero;
 
     auto overlay_size = [&] {
         if (!minimized) return CGSizeMake(full_w, full_h);
@@ -1073,7 +1275,8 @@ int main(int argc, char** argv) {
       @autoreleasepool {
         double timeout = 0.25;  // hidden: just keep watching for the game
         if (shown) timeout = verifying ? 0.02 : keyboard.text_active.load() ? 0.1 : 1.0;
-        if (pending.valid() || catalog_task.valid()) timeout = std::min(timeout, 0.1);
+        if (pending.valid() || catalog_task.valid() || offsets_task.valid() || follow_up)
+            timeout = std::min(timeout, 0.1);
         if (frames_left > 0) glfwPollEvents(); else glfwWaitEventsTimeout(timeout);
         Clock::time_point now = Clock::now();
         const GameSnapshot snap = watcher.get();
@@ -1114,24 +1317,161 @@ int main(int argc, char** argv) {
         }
         if (shown) sync_position(snap, now);
         keyboard.overlay_visible.store(shown && !initial_verification);
+        if (offsets_task.valid() &&
+            offsets_task.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            try {
+                profile_ready = offsets_task.get();
+                message = profile_ready ? "Offsets refreshed" :
+                    "Offset scan failed for this game build; switching is disabled";
+            } catch (const std::exception& error) {
+                profile_ready = false;
+                message = std::string("Offset refresh failed: ") + error.what();
+            }
+            frames_left = 3;
+        }
         if (catalog_task.valid() &&
             catalog_task.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            catalog_ready = catalog_task.get();
-            if (!catalog_ready) message = "Skin list refresh failed";
-            if (catalog_ready) {
-                auto refreshed = load_skins(directory / "skin_ids.json");
-                if (!refreshed.empty()) {
-                    champions = std::move(refreshed);
-                    champion_index = std::min(champion_index, static_cast<int>(champions.size() - 1));
-                    skin_index = 0;
-                } else catalog_ready = false;
+            try {
+                const bool downloaded = catalog_task.get();
+                if (downloaded) {
+                    auto refreshed = load_skins(directory / "skin_ids.json");
+                    if (!refreshed.empty()) {
+                        champions = std::move(refreshed);
+                        champion_index = std::min(champion_index, static_cast<int>(champions.size() - 1));
+                        skin_index = 0;
+                        catalog_ready = true;
+                        message = profile_ready ? "Offsets and skins refreshed" :
+                            "Skins refreshed; offset scan failed for this game build";
+                    } else {
+                        message = "Downloaded skin list could not be loaded";
+                    }
+                } else {
+                    message = "Skin list refresh failed; previous list retained";
+                }
+            } catch (const std::exception& error) {
+                message = std::string("Skin list refresh failed: ") + error.what();
             }
             frames_left = 3;
         }
         if (pending.valid() && pending.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
-            message = pending.get();
+            const CommandResult result = pending.get();
+            // A background form or animation pass keeps the current message.
+            if (!result.message.empty()) message = result.message;
             frames_left = 3;
+            if (result.command == "liveskin" && result.code == 0) {
+                applied = {snap.pid, result.champion, result.skin, result.gear,
+                           std::max(result.forms, 0)};
+                // The game loads the new skin's mesh and animations after the
+                // switch; read its forms and apply the form and animation
+                // fixes again once it has.
+                follow_up = true;
+                follow_up_attempts = 0;
+                follow_up_at = now + 1500ms;
+            } else if (result.command == "liveform") {
+                if (result.forms >= 0) applied.forms = result.forms;
+                if (result.code == 0 || result.code == 3) applied.gear = result.gear;
+                if (result.code == 3 && follow_up_attempts < 3) {
+                    follow_up = true;
+                    follow_up_at = now + 2s;
+                }
+            }
         }
+        if (applied.pid && applied.pid != snap.pid) { applied = {}; follow_up = false; }
+        if (follow_up && now >= follow_up_at && !pending.valid() && snap.pid && profile_ready) {
+            follow_up = false;
+            ++follow_up_attempts;
+            const AppliedSkin target = applied;
+            const pid_t target_pid = snap.pid;
+            pending = std::async(std::launch::async, [tool, target_pid, target] {
+                return run_command(tool, "liveform", target_pid, target.champion, target.skin,
+                                   target.gear);
+            });
+        }
+        // The skin's own form picker, redrawn from the game's files over its HUD.
+        const stallion::SkinHudSpec* hud_spec = applied.pid && applied.pid == snap.pid
+            ? stallion::skin_hud_spec(applied.champion, applied.skin) : nullptr;
+        if (hud_spec && hud_spec != hud_failed && !hud_download.valid() &&
+            (!skin_hud || skin_hud->spec() != hud_spec)) {
+            hud_download_spec = hud_spec;
+            hud_download = std::async(std::launch::async, [hud_cache, patch, hud_spec] {
+                return fetch_skin_hud(hud_cache, patch, *hud_spec);
+            });
+        }
+        if (hud_download.valid() &&
+            hud_download.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            auto hud = std::make_unique<stallion::SkinHud>();
+            std::string error = "download failed";
+            if (hud_download.get() && hud->load(read_file(hud_cache / hud_download_spec->layout),
+                                                *hud_download_spec, hud_cache, error)) {
+                if (skin_hud && hud_shown) [skin_hud->window() orderOut:nil];
+                skin_hud = std::move(hud);
+                hud_shown = false;
+            } else {
+                hud_failed = hud_download_spec;
+                std::fprintf(stderr, "skin HUD: %s\n", error.c_str());
+                message = "The skin's own HUD could not be loaded; the form buttons still work";
+                frames_left = 3;
+            }
+        }
+        HudInput hud_input;
+        if (hud_spec && skin_hud && skin_hud->spec() == hud_spec && shown && !initial_verification &&
+            snap.stable) {
+            if (now - hud_scale_read > 2s) {
+                hud_scale = stallion::skin_hud_scale(hud_scale_setting(game));
+                hud_scale_read = now;
+            }
+            const bool forms_busy = pending.valid() || offsets_task.valid() || catalog_task.valid() ||
+                                    !profile_ready || !snap.foreground;
+            std::vector<HudEvent> events;
+            { std::lock_guard<std::mutex> lock(keyboard.mutex); events.swap(keyboard.hud_events); }
+            bool dirty = skin_hud->set_form(applied.gear);
+            for (const HudEvent& event : events) {
+                switch (event.kind) {
+                case HudEventKind::Hover:
+                    dirty |= skin_hud->set_hover(event.region);
+                    dirty |= skin_hud->set_cursor(prefs.cursor, event.point);
+                    break;
+                case HudEventKind::Press: dirty |= skin_hud->set_pressed(event.region); break;
+                case HudEventKind::Release:
+                    dirty |= skin_hud->set_pressed(-1);
+                    if (event.region == skin_hud->toggle_region())
+                        dirty |= skin_hud->set_menu_open(!skin_hud->menu_open());
+                    else if (event.region >= 0 && event.region != applied.gear && !forms_busy)
+                        apply_form(snap.pid, applied.champion, applied.skin, event.region);
+                    break;
+                case HudEventKind::DragStart:
+                    hud_drag_start = event.point;
+                    hud_drag_origin = CGPointMake(prefs.hud_dx, prefs.hud_dy);
+                    break;
+                case HudEventKind::Drag:
+                case HudEventKind::DragEnd: {
+                    // Offsets are kept in layout units so they follow resolution changes.
+                    const double scale = std::max(skin_hud->layout_scale(), 0.01);
+                    prefs.hud_dx = hud_drag_origin.x + (event.point.x - hud_drag_start.x) / scale;
+                    prefs.hud_dy = hud_drag_origin.y + (event.point.y - hud_drag_start.y) / scale;
+                    dirty |= skin_hud->set_cursor(prefs.cursor, event.point);
+                    if (event.kind == HudEventKind::DragEnd) { prefs_dirty = true; last_pref_change = now; }
+                    break;
+                }
+                }
+            }
+            if (skin_hud->layout(snap.rect, hud_scale, CGPointMake(prefs.hud_dx, prefs.hud_dy)) ||
+                !hud_shown) {
+                place_window(skin_hud->window(), skin_hud->frame().origin);
+                dirty = true;
+            }
+            if (!hud_shown) {
+                [skin_hud->window() orderFrontRegardless];
+                hud_shown = true;
+            }
+            if (dirty) skin_hud->redraw();
+            hud_input = {true, skin_hud->frame(), skin_hud->regions()};
+        } else {
+            if (hud_shown) { [skin_hud->window() orderOut:nil]; hud_shown = false; }
+            std::lock_guard<std::mutex> lock(keyboard.mutex);
+            keyboard.hud_events.clear();
+        }
+        { std::lock_guard<std::mutex> lock(keyboard.hud_mutex); keyboard.hud = hud_input; }
         if (prefs_dirty && !keyboard.mouse_captured.load() && !minimized &&
             now - last_pref_change > 600ms) {
             prefs.width = want_w;
@@ -1224,17 +1564,28 @@ int main(int argc, char** argv) {
         if (!minimized) {
         ImGui::Text("Game: %s | Offsets: %s | Skins: %s",
             snap.foreground ? "READY" : "WAITING FOR A MATCH",
-            profile_ready ? "OK" : "ERROR",
+            offsets_task.valid() ? "CHECKING" : (profile_ready ? "OK" : "ERROR"),
             catalog_task.valid() ? "CHECKING" : (catalog_ready ? "OK" : "OUTDATED"));
         {
             const float refresh_w = ImGui::CalcTextSize("Refresh").x + 2 * style.FramePadding.x;
             ImGui::SameLine(std::max(ImGui::GetCursorPosX(), ImGui::GetWindowWidth() - refresh_w -
                                                                  style.WindowPadding.x));
-            if (catalog_task.valid()) ImGui::BeginDisabled();
-            if (ImGui::SmallButton("Refresh"))
-                catalog_task = std::async(std::launch::async,
-                    [directory, game] { return update_catalog(directory, game); });
-            if (catalog_task.valid()) ImGui::EndDisabled();
+            // A click creates both futures mid-frame. Keep BeginDisabled and
+            // EndDisabled paired using the state from before the click.
+            const bool refreshing = catalog_task.valid() || offsets_task.valid();
+            if (refreshing) ImGui::BeginDisabled();
+            if (ImGui::SmallButton("Refresh")) {
+                message = "Refreshing offsets and skins...";
+                try {
+                    offsets_task = std::async(std::launch::async,
+                        [directory, game] { return update_offsets(directory, game); });
+                    catalog_task = std::async(std::launch::async,
+                        [directory, game] { return update_catalog(directory, game); });
+                } catch (const std::exception& error) {
+                    message = std::string("Could not start refresh: ") + error.what();
+                }
+            }
+            if (refreshing) ImGui::EndDisabled();
         }
         ImGui::Separator();
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -1247,8 +1598,20 @@ int main(int argc, char** argv) {
         const float button_height = 32 * scale;
         const float message_height = ImGui::CalcTextSize(message.c_str(), nullptr, false,
             ImGui::GetContentRegionAvail().x).y;
+        // Form buttons: named ones for known skins, and after a switch as many as
+        // the game reports for the skin, so every skin with forms gets them.
+        auto form_count = [&](const std::string& name, unsigned number) {
+            const bool live = applied.pid == snap.pid && applied.champion == name &&
+                              applied.skin == number;
+            return live && applied.forms > 0 ? applied.forms : stallion::form_names(name, number).count;
+        };
+        auto form_rows = [](int count) { return count <= 5 ? 1 : 2; };
+        const auto& selected = champions[champion_index];
+        const int selected_forms = form_count(selected.name, selected.skins[skin_index].number);
+        const float forms_height = selected_forms
+            ? form_rows(selected_forms) * (ImGui::GetFrameHeight() + spacing) : 0;
         const float fixed = ImGui::GetTextLineHeight() + button_height + message_height +
-                            5 * spacing + 10 * scale;
+                            forms_height + 5 * spacing + 10 * scale;
         const float lists = std::max(6 * row, ImGui::GetContentRegionAvail().y - fixed);
         const float champion_height = std::max(3 * row, std::floor(lists * 0.55f));
         const float skin_height = std::max(3 * row, lists - champion_height);
@@ -1272,24 +1635,59 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < champion.skins.size(); ++i) {
                 const auto& skin = champion.skins[i];
                 std::string label = skin.name + " (" + std::to_string(skin.number) + ")";
-                if (ImGui::Selectable(label.c_str(), skin_index == static_cast<int>(i)))
+                if (ImGui::Selectable(label.c_str(), skin_index == static_cast<int>(i))) {
                     skin_index = static_cast<int>(i);
+                }
             }
             ImGui::EndListBox();
         }
-        bool busy = pending.valid() || !profile_ready || !catalog_ready ||
-                    !input_ready || !snap.foreground;
-        if (busy) ImGui::BeginDisabled();
-        if (ImGui::Button("Switch in game", ImVec2(-FLT_MIN, button_height))) {
+        const bool busy = pending.valid() || offsets_task.valid() || catalog_task.valid() ||
+                          !profile_ready || !catalog_ready ||
+                          !input_ready || !snap.foreground;
+        auto switch_skin = [&] {
             std::string name = champion.name;
             unsigned number = champion.skins[skin_index].number;
+            // Gear zero is the neutral initial state for known gear-based skins.
+            // The game's native HUD is not recreated by this live operation.
+            int gear = stallion::special_forms(name, number).count ? 0 : -1;
             message = "Switching...";
+            follow_up = false;
             pid_t target_pid = snap.pid;
-            pending = std::async(std::launch::async, [tool, target_pid, name, number] {
-                return run_command(tool, "liveskin", target_pid, name, number);
+            pending = std::async(std::launch::async, [tool, target_pid, name, number, gear] {
+                return run_command(tool, "liveskin", target_pid, name, number, gear);
             });
+        };
+        if (busy) ImGui::BeginDisabled();
+        if (ImGui::Button("Switch in game", ImVec2(-FLT_MIN, button_height))) {
+            switch_skin();
         }
         if (busy) ImGui::EndDisabled();
+        // A click in the lists above may have changed the selection this frame.
+        const unsigned number = champion.skins[skin_index].number;
+        const int forms = form_count(champion.name, number);
+        if (forms) {
+            // The game's own form selector is built only for a skin chosen before
+            // the match, so the forms of the switched skin are offered here.
+            // Choosing the current form again restores it after a respawn.
+            const auto names = stallion::form_names(champion.name, number);
+            const bool live = applied.pid == snap.pid && applied.champion == champion.name &&
+                              applied.skin == number;
+            const bool disabled = busy || !live;
+            if (disabled) ImGui::BeginDisabled();
+            const int per_row = (forms + form_rows(forms) - 1) / form_rows(forms);
+            const float width = (ImGui::GetContentRegionAvail().x -
+                                 style.ItemSpacing.x * (per_row - 1)) / per_row;
+            for (int i = 0; i < forms; ++i) {
+                if (i % per_row) ImGui::SameLine();
+                const std::string label = i < names.count ? names.names[i] : std::to_string(i + 1);
+                const bool current = live && applied.gear == i;
+                if (current) ImGui::PushStyleColor(ImGuiCol_Button, style.Colors[ImGuiCol_ButtonActive]);
+                if (ImGui::Button(label.c_str(), ImVec2(width, 0)))
+                    apply_form(snap.pid, champion.name, number, i);
+                if (current) ImGui::PopStyleColor();
+            }
+            if (disabled) ImGui::EndDisabled();
+        }
         ImGui::TextWrapped("%s", message.c_str());
         // Resize grip in the bottom-right corner; dragging it resizes the overlay.
         const float grip = 16 * scale;
@@ -1341,7 +1739,10 @@ int main(int argc, char** argv) {
       }
     }
     glfwHideWindow(window);
+    if (hud_download.valid()) hud_download.wait();
+    skin_hud.reset();
     if (pending.valid()) pending.wait();
+    if (offsets_task.valid()) offsets_task.wait();
     if (catalog_task.valid()) catalog_task.wait();
     if (prefs_dirty && !minimized) {
         prefs.width = want_w;

@@ -20,7 +20,7 @@ $(BUILD):
 	mkdir -p $(BUILD)
 
 $(BUILD)/StallionSkinChanger: FORCE imgui $(BUILD)
-	$(CXX) $(CXXFLAGS) -x objective-c++ src/main.mm $(IMGUI_CPP) $(IMGUI_BACKENDS) $(LDFLAGS) -o $@
+	$(CXX) $(CXXFLAGS) -x objective-c++ src/main.mm src/skin_hud.mm $(IMGUI_CPP) $(IMGUI_BACKENDS) $(LDFLAGS) -o $@
 
 $(BUILD)/stallion-core: FORCE $(BUILD)
 	$(CXX) $(CXXFLAGS) src/core.cpp src/live_skin.cpp -o $@ -lproc
@@ -31,6 +31,8 @@ offsets: all
 	python3 tools/scan_offsets.py --output offsets.json
 
 clean:
-	rm -rf $(BUILD)
+	# Keep the tracked build/riot_catalog snapshot; remove generated outputs only.
+	rm -rf $(IMGUI_DIR) $(BUILD)/StallionSkinChanger $(BUILD)/stallion-core \
+		$(BUILD)/core.entitlements $(BUILD)/riot_catalog_runtime
 
 FORCE:
